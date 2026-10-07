@@ -1,7 +1,7 @@
 use arc_swap::ArcSwap;
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::{net::IpAddr, net::SocketAddr};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tracing::warn;
 
@@ -11,6 +11,15 @@ use pumpkin_protocol::Property;
 /// The property name the `BungeeGuard` plugin uses to forward its shared
 /// secret inside the profile properties.
 const BUNGEEGUARD_TOKEN_PROPERTY: &str = "bungeeguard-token";
+
+/// Compares a forwarded token against the configured secret without leaking
+/// where they start to differ.
+fn constant_time_eq(supplied: &str, configured: &str) -> bool {
+    if supplied.len() != configured.len() {
+        return false;
+    }
+    supplied.as_bytes().ct_eq(configured.as_bytes()).into()
+}
 
 #[derive(Error, Debug)]
 pub enum BungeeCordError {
@@ -91,7 +100,7 @@ pub fn bungeecord_login(
             .collect();
 
         match token_props.as_slice() {
-            [token] if token.value.as_ref() == secret => {
+            [token] if constant_time_eq(token.value.as_ref(), secret) => {
                 properties.retain(|property| property.name.as_ref() != BUNGEEGUARD_TOKEN_PROPERTY);
             }
             [] => {
@@ -108,19 +117,13 @@ pub fn bungeecord_login(
                 return Err(BungeeCordError::MissingToken);
             }
             _ => {
-                // Log only SHA-256 hashes: one-way, so the secret never leaks,
-                // but enough to tell a mismatch from duplicated tokens apart.
-                let token_hashes: Vec<String> = token_props
-                    .iter()
-                    .map(|property| hex::encode(Sha256::digest(property.value.as_bytes())))
-                    .collect();
+                // The configured secret is not logged, not even hashed: an
+                // unsalted hash of it confirms a guess offline, and logs get
+                // shared in bug reports.
                 warn!(
-                    "Rejecting login: expected exactly one matching `{}` property, \
-                     found {} (token hashes: {token_hashes:?}, configured secret \
-                     hash: {})",
+                    "Rejecting login: expected exactly one `{}` property, found {}",
                     BUNGEEGUARD_TOKEN_PROPERTY,
-                    token_props.len(),
-                    hex::encode(Sha256::digest(secret.as_bytes()))
+                    token_props.len()
                 );
                 return Err(BungeeCordError::InvalidToken);
             }
