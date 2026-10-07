@@ -26,10 +26,16 @@ pub struct SChatCommandSigned<'a> {
 
 impl<'a> ServerPacket<'a> for SChatCommandSigned<'a> {
     fn read(read: &mut &'a [u8], version: &JavaMinecraftVersion) -> Result<Self, ReadingError> {
+        // Vanilla caps argument signatures at 8 (ArgumentSignatures). Bound it before
+        // allocating so a crafted count can't force a huge allocation.
+        const MAX_ARGUMENT_SIGNATURES: usize = 8;
         let command = read.get_str_bounded_borrowed(256)?;
         let timestamp = read.get_i64_be()?;
         let salt = read.get_i64_be()?;
         let arg_count = read.get_var_int()?.0 as usize;
+        if arg_count > MAX_ARGUMENT_SIGNATURES {
+            return Err(ReadingError::TooLarge("argument signatures".into()));
+        }
         let mut argument_signatures = Vec::with_capacity(arg_count);
         for _ in 0..arg_count {
             let name = read.get_str_bounded_borrowed(16)?;
@@ -76,5 +82,26 @@ impl ClientPacket for SChatCommandSigned<'_> {
             write.write_u8(self.checksum)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ser::NetworkWriteExt;
+
+    // A crafted `argument_signatures` count must be rejected before it is used to
+    // size the allocation, otherwise one tiny packet forces a multi-gigabyte alloc.
+    #[test]
+    fn rejects_huge_argument_signature_count() {
+        let mut buf = Vec::new();
+        buf.write_string("").unwrap();
+        buf.write_i64_be(0).unwrap();
+        buf.write_i64_be(0).unwrap();
+        buf.write_var_int(&VarInt(i32::MAX)).unwrap();
+
+        let mut slice = buf.as_slice();
+        let result = SChatCommandSigned::read(&mut slice, &JavaMinecraftVersion::V_1_21_5);
+        assert!(matches!(result, Err(ReadingError::TooLarge(_))));
     }
 }

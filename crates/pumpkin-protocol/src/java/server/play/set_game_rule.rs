@@ -20,7 +20,12 @@ pub struct SSetGameRule<'a> {
 
 impl<'a> ServerPacket<'a> for SSetGameRule<'a> {
     fn read(bytebuf: &mut &'a [u8], _version: &JavaMinecraftVersion) -> Result<Self, ReadingError> {
+        // A client can send at most one entry per known game rule. Bound it before
+        // allocating so a crafted count can't force a huge allocation.
         let count = bytebuf.get_var_int()?.0 as usize;
+        if count > pumpkin_data::game_rules::GameRule::all().len() {
+            return Err(ReadingError::TooLarge("game rule entries".into()));
+        }
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
             let game_rule_key = bytebuf.get_str_borrowed()?;
