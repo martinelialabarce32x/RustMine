@@ -17,12 +17,15 @@ use tracing::{error, info};
 
 use crate::{SHOULD_STOP, STOP_INTERRUPT, server::Server};
 
+/// Upper bound on stored challenge tokens. A spoofed source address costs one
+/// entry, so the table has to be capped.
+const MAX_CHALLENGE_TOKENS: usize = 4096;
+
 pub async fn start_query_handler(server: Arc<Server>, query_addr: SocketAddr) {
     let Ok(socket) = UdpSocket::bind(query_addr).await else {
         error!("Unable to bind query UDP socket");
         return;
     };
-    let socket = Arc::new(socket);
 
     // Challenge tokens are bound to the IP address and port
     let valid_challenge_tokens = Arc::new(RwLock::new(HashMap::new()));
@@ -33,7 +36,9 @@ pub async fn start_query_handler(server: Arc<Server>, query_addr: SocketAddr) {
 
         loop {
             interval.tick().await;
-            valid_challenge_tokens_clone.write().await.clear();
+            // Replace the map instead of clearing it, because `clear` keeps
+            // whatever capacity a flood of handshakes grew it to.
+            *valid_challenge_tokens_clone.write().await = HashMap::new();
         }
     });
 
@@ -46,12 +51,11 @@ pub async fn start_query_handler(server: Arc<Server>, query_addr: SocketAddr) {
         );
     }
 
-    while !SHOULD_STOP.load(Ordering::Relaxed) {
-        let socket = socket.clone();
-        let valid_challenge_tokens = valid_challenge_tokens.clone();
-        let server = server.clone();
-        let mut buf = vec![0; 1024];
+    // Reused across packets. Handling is done inline so a flood of datagrams
+    // cannot pile up unbounded tasks, each owning a buffer of its own.
+    let mut buf = vec![0; 1024];
 
+    while !SHOULD_STOP.load(Ordering::Relaxed) {
         let recv_result = tokio::select! {
             result = socket.recv_from(&mut buf) => Some(result),
             () = STOP_INTERRUPT.cancelled() => None,
@@ -61,22 +65,18 @@ pub async fn start_query_handler(server: Arc<Server>, query_addr: SocketAddr) {
             break;
         };
 
-        buf.truncate(length);
-
-        tokio::spawn(async move {
-            if let Err(err) = handle_packet(
-                buf,
-                valid_challenge_tokens,
-                server,
-                socket,
-                addr,
-                query_addr,
-            )
-            .await
-            {
-                error!("Interior 0 bytes found! Cannot encode query response! {err}");
-            }
-        });
+        if let Err(err) = handle_packet(
+            buf[..length].to_vec(),
+            &valid_challenge_tokens,
+            &server,
+            &socket,
+            addr,
+            query_addr,
+        )
+        .await
+        {
+            error!("Interior 0 bytes found! Cannot encode query response! {err}");
+        }
     }
 }
 
@@ -87,9 +87,9 @@ pub async fn start_query_handler(server: Arc<Server>, query_addr: SocketAddr) {
 #[inline]
 async fn handle_packet(
     buf: Vec<u8>,
-    clients: Arc<RwLock<HashMap<i32, SocketAddr>>>,
-    server: Arc<Server>,
-    socket: Arc<UdpSocket>,
+    clients: &RwLock<HashMap<SocketAddr, i32>>,
+    server: &Server,
+    socket: &UdpSocket,
     addr: SocketAddr,
     bound_addr: SocketAddr,
 ) -> Result<(), NulError> {
@@ -109,7 +109,12 @@ async fn handle_packet(
                         let _ = socket.send_to(encoded.as_slice(), addr).await;
                     }
 
-                    clients.write().await.insert(challenge_token, addr);
+                    let mut tokens = clients.write().await;
+                    // Keying by address keeps one entry per source, so a flood
+                    // of spoofed handshakes cannot grow the table without end.
+                    if tokens.len() < MAX_CHALLENGE_TOKENS || tokens.contains_key(&addr) {
+                        tokens.insert(addr, challenge_token);
+                    }
                 }
             }
             PacketType::Status => {
@@ -117,8 +122,8 @@ async fn handle_packet(
                     && clients
                         .read()
                         .await
-                        .get(&packet.challenge_token)
-                        .is_some_and(|token_bound_ip: &SocketAddr| token_bound_ip == &addr)
+                        .get(&addr)
+                        .is_some_and(|token| *token == packet.challenge_token)
                 {
                     if packet.is_full_request {
                         // Get 4 players
