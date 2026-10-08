@@ -26,7 +26,8 @@ impl<'a> ServerPacket<'a> for SSetGameRule<'a> {
         // send more entries than there are game rules still decodes, the Vec just grows.
         // What this stops is a count with nothing behind it sizing the allocation, since
         // the loop below gives up as soon as the buffer runs out.
-        let mut entries = Vec::with_capacity(count.min(pumpkin_data::game_rules::GameRule::all().len()));
+        let mut entries =
+            Vec::with_capacity(count.min(pumpkin_data::game_rules::GameRule::all().len()));
         for _ in 0..count {
             let game_rule_key = bytebuf.get_str_borrowed()?;
             let value = bytebuf.get_str_borrowed()?;
