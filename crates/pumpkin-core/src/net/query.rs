@@ -5,12 +5,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use hmac::{Hmac, KeyInit, Mac};
 use pumpkin_protocol::query::{
     CBasicStatus, CFullStatus, CHandshake, PacketType, RawQueryPacket, SHandshake, SStatusRequest,
 };
 use pumpkin_util::text::{TextComponent, color::NamedColor};
 use pumpkin_world::CURRENT_MC_VERSION;
-use hmac::{Hmac, KeyInit, Mac};
 use rand::Rng;
 use sha2::Sha256;
 use tokio::net::UdpSocket;
@@ -136,7 +136,6 @@ async fn handle_packet(
                     if let Some(encoded) = response.encode() {
                         let _ = socket.send_to(encoded.as_slice(), addr).await;
                     }
-
                 }
             }
             PacketType::Status => {
