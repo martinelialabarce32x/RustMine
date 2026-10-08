@@ -144,6 +144,20 @@ fn give_player_bucket_item(player: &Player, item: &'static Item) {
     }
 }
 
+/// Mirrors vanilla `ItemUtils.createFilledResult` without the creative stack limit.
+pub(crate) fn create_filled_result(item: &mut ItemStack, player: &Player, filled: &'static Item) {
+    item.decrement_unless_creative(player.gamemode.load(), 1);
+    let mut filled_stack = ItemStack::new(1, filled);
+    if item.is_empty() {
+        *item = filled_stack;
+    } else if !player.inventory.insert_stack_anywhere(&mut filled_stack) && !filled_stack.is_empty()
+    {
+        player
+            .world()
+            .drop_stack(&player.position().to_block_pos(), filled_stack);
+    }
+}
+
 pub(crate) fn try_pickup_fluid_at(
     world: &Arc<World>,
     block_pos: BlockPos,
@@ -470,7 +484,7 @@ impl ItemBehaviour for FilledBucketItem {
                 let ent = entity.get_entity();
                 let world = ent.world.load();
                 world.play_sound(sound, SoundCategory::Neutral, &ent.pos.load());
-                give_player_bucket_item(player, mob_bucket);
+                create_filled_result(item, player, mob_bucket);
                 ent.remove();
             }
         }
