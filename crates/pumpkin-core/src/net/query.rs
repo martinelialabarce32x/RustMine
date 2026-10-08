@@ -1,9 +1,8 @@
 use std::{
-    collections::HashMap,
     ffi::{CString, NulError},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, atomic::Ordering},
-    time::Duration,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use pumpkin_protocol::query::{
@@ -11,15 +10,50 @@ use pumpkin_protocol::query::{
 };
 use pumpkin_util::text::{TextComponent, color::NamedColor};
 use pumpkin_world::CURRENT_MC_VERSION;
-use rand::RngExt;
-use tokio::{net::UdpSocket, sync::RwLock, time};
+use hmac::{Hmac, KeyInit, Mac};
+use rand::Rng;
+use sha2::Sha256;
+use tokio::net::UdpSocket;
 use tracing::{error, info};
 
 use crate::{SHOULD_STOP, STOP_INTERRUPT, server::Server};
 
-/// Upper bound on stored challenge tokens. A spoofed source address costs one
-/// entry, so the table has to be capped.
-const MAX_CHALLENGE_TOKENS: usize = 4096;
+/// How long a challenge token stays valid. A token is accepted for the window it
+/// was minted in and the one before it, so it lives between one and two of these.
+const TOKEN_WINDOW: u64 = 30;
+
+/// The challenge token for a source address, derived rather than stored.
+///
+/// Query runs over UDP, so the source address of a handshake is trivially forged.
+/// Keeping a table of issued tokens means an attacker picks how much the server
+/// remembers; capping that table only moves the problem, since a flood of spoofed
+/// handshakes then fills the cap and locks real clients out of getting a token.
+///
+/// Deriving the token instead leaves nothing to fill. The secret is per process,
+/// so a token cannot be carried to another server or survive a restart, and it is
+/// still bound to the address, which is what makes the handshake prove the client
+/// can receive at the address it claims.
+fn challenge_token(key: &Hmac<Sha256>, addr: SocketAddr, window: u64) -> i32 {
+    let mut mac = key.clone();
+    match addr.ip() {
+        IpAddr::V4(ip) => mac.update(&ip.octets()),
+        IpAddr::V6(ip) => mac.update(&ip.octets()),
+    }
+    mac.update(&addr.port().to_be_bytes());
+    mac.update(&window.to_be_bytes());
+
+    let bytes = mac.finalize().into_bytes();
+    let value = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    // The wire format is a signed int, and vanilla never sends 0.
+    let token = (value & 0x7FFF_FFFF) as i32;
+    if token == 0 { 1 } else { token }
+}
+
+fn current_window() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() / TOKEN_WINDOW)
+}
 
 pub async fn start_query_handler(server: Arc<Server>, query_addr: SocketAddr) {
     let Ok(socket) = UdpSocket::bind(query_addr).await else {
@@ -27,20 +61,14 @@ pub async fn start_query_handler(server: Arc<Server>, query_addr: SocketAddr) {
         return;
     };
 
-    // Challenge tokens are bound to the IP address and port
-    let valid_challenge_tokens = Arc::new(RwLock::new(HashMap::new()));
-    let valid_challenge_tokens_clone = valid_challenge_tokens.clone();
-    // All challenge tokens ever created are expired every 30 seconds
-    tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_secs(30));
-
-        loop {
-            interval.tick().await;
-            // Replace the map instead of clearing it, because `clear` keeps
-            // whatever capacity a flood of handshakes grew it to.
-            *valid_challenge_tokens_clone.write().await = HashMap::new();
-        }
-    });
+    // Tokens are derived from this and the source address, so there is no table to
+    // expire and nothing an attacker can make the server remember.
+    let mut secret = [0u8; 32];
+    rand::rng().fill_bytes(&mut secret);
+    let Ok(token_key) = <Hmac<Sha256> as KeyInit>::new_from_slice(&secret) else {
+        error!("Unable to derive query challenge token key");
+        return;
+    };
 
     if let Ok(local_addr) = socket.local_addr() {
         info!(
@@ -67,7 +95,7 @@ pub async fn start_query_handler(server: Arc<Server>, query_addr: SocketAddr) {
 
         if let Err(err) = handle_packet(
             buf[..length].to_vec(),
-            &valid_challenge_tokens,
+            &token_key,
             &server,
             &socket,
             addr,
@@ -87,7 +115,7 @@ pub async fn start_query_handler(server: Arc<Server>, query_addr: SocketAddr) {
 #[inline]
 async fn handle_packet(
     buf: Vec<u8>,
-    clients: &RwLock<HashMap<SocketAddr, i32>>,
+    token_key: &Hmac<Sha256>,
     server: &Server,
     socket: &UdpSocket,
     addr: SocketAddr,
@@ -97,7 +125,7 @@ async fn handle_packet(
         match raw_packet.packet_type {
             PacketType::Handshake => {
                 if let Ok(packet) = SHandshake::decode(&mut raw_packet).await {
-                    let challenge_token = rand::rng().random_range(1..=i32::MAX);
+                    let challenge_token = challenge_token(token_key, addr, current_window());
                     let response = CHandshake {
                         session_id: packet.session_id,
                         challenge_token,
@@ -109,21 +137,18 @@ async fn handle_packet(
                         let _ = socket.send_to(encoded.as_slice(), addr).await;
                     }
 
-                    let mut tokens = clients.write().await;
-                    // Keying by address keeps one entry per source, so a flood
-                    // of spoofed handshakes cannot grow the table without end.
-                    if tokens.len() < MAX_CHALLENGE_TOKENS || tokens.contains_key(&addr) {
-                        tokens.insert(addr, challenge_token);
-                    }
                 }
             }
             PacketType::Status => {
                 if let Ok(packet) = SStatusRequest::decode(&mut raw_packet).await
-                    && clients
-                        .read()
-                        .await
-                        .get(&addr)
-                        .is_some_and(|token| *token == packet.challenge_token)
+                    // The window the token was minted in may have rolled over since,
+                    // so the previous one is accepted as well.
+                    && {
+                        let window = current_window();
+                        packet.challenge_token == challenge_token(token_key, addr, window)
+                            || packet.challenge_token
+                                == challenge_token(token_key, addr, window.saturating_sub(1))
+                    }
                 {
                     if packet.is_full_request {
                         // Get 4 players
