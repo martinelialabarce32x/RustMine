@@ -6,9 +6,9 @@ use pumpkin_data::attributes::Attributes;
 use pumpkin_data::effect::StatusEffect;
 use rand::RngExt;
 
-use crate::entity::EntityBase;
 use crate::entity::attributes::{Modifier, ModifierOperation};
 use crate::entity::mob::MobEntity;
+use crate::entity::{Entity, EntityBase};
 use crate::world::World;
 
 const RANDOM_SPAWN_BONUS_ID: &str = "minecraft:random_spawn_bonus";
@@ -85,6 +85,7 @@ impl MobEntity {
             .age
             .store(-24000, std::sync::atomic::Ordering::Relaxed);
         entity.set_synced_data(pumpkin_data::tracked_data::ageable_mob::DATA_BABY_ID, true);
+        entity.set_default_dimensions(Entity::baby_dimensions(entity.entity_type));
     }
 
     /// Baby state kept as a mob's own flag and synced key (vanilla zombies and piglins), so it
@@ -103,5 +104,10 @@ impl MobEntity {
             if baby { -24000 } else { 0 },
             std::sync::atomic::Ordering::Relaxed,
         );
+        entity.set_default_dimensions(if baby {
+            Entity::baby_dimensions(entity.entity_type)
+        } else {
+            Entity::type_dimensions(entity.entity_type)
+        });
     }
 }

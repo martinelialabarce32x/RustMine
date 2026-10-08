@@ -1,6 +1,7 @@
 use pumpkin_data::tracked_data;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering::Relaxed};
 
+use crate::entity::Entity;
 use crate::entity::mob::Mob;
 
 pub const BABY_START_AGE: i32 = -24000;
@@ -51,6 +52,11 @@ pub trait AgeableMob: Mob {
         if (old_age < 0 && new_age >= 0) || (old_age >= 0 && new_age < 0) {
             let is_baby = new_age < 0;
             entity.set_synced_data(tracked_data::ageable_mob::DATA_BABY_ID, is_baby);
+            entity.set_default_dimensions(if is_baby {
+                Entity::baby_dimensions(entity.entity_type)
+            } else {
+                Entity::type_dimensions(entity.entity_type)
+            });
         }
     }
 
