@@ -170,7 +170,8 @@ fn get_inventory_if_double_chest(
     target_pos: &BlockPos,
     entity: &Arc<dyn BlockEntity>,
 ) -> Option<Arc<dyn Inventory + 'static>> {
-    if !ChestLikeProperties::handles_block_id(world.get_block(target_pos).id) {
+    let target_block = world.get_block(target_pos);
+    if !ChestLikeProperties::handles_block_id(target_block.id) {
         return None;
     }
 
@@ -182,6 +183,19 @@ fn get_inventory_if_double_chest(
     };
 
     let neighbor_pos = target_pos.offset(offset_dir.to_offset());
+    let (neighbor_block, neighbor_state_id) = world.get_block_and_state_id(&neighbor_pos);
+    let expected_type = match chest_props.r#type {
+        ChestType::Left => ChestType::Right,
+        ChestType::Right => ChestType::Left,
+        ChestType::Single => return None,
+    };
+    if neighbor_block != target_block {
+        return None;
+    }
+    let neighbor_props = ChestLikeProperties::from_state_id(neighbor_state_id);
+    if neighbor_props.facing != chest_props.facing || neighbor_props.r#type != expected_type {
+        return None;
+    }
     let second_entity = world.get_block_entity(&neighbor_pos)?;
 
     let first_inventory = entity.clone().get_inventory()?;
