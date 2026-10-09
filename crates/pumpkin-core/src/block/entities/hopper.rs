@@ -1,11 +1,14 @@
 use crate::block::entities::BlockEntity;
 use crate::entity::experience_orb::ExperienceOrbEntity;
 use crate::world::World;
-use pumpkin_data::block_properties::{FacingHopper, HopperLikeProperties};
+use pumpkin_data::block_properties::{
+    BlockProperties, ChestLikeProperties, ChestType, FacingHopper, HopperLikeProperties,
+};
 use pumpkin_data::item_stack::ItemStack;
 use pumpkin_data::tag;
 use pumpkin_data::tag::Taggable;
 use pumpkin_data::{BlockId, BlockStateId};
+use pumpkin_inventory::double::DoubleInventory;
 use pumpkin_inventory::{Clearable, Inventory, sync_write_items_to_nbt};
 use pumpkin_nbt::compound::NbtCompound;
 use pumpkin_nbt::tag::NbtTag;
@@ -162,6 +165,37 @@ impl BlockEntity for HopperBlockEntity {
     }
 }
 
+fn get_inventory_if_double_chest(
+    world: &Arc<World>,
+    target_pos: &BlockPos,
+    entity: &Arc<dyn BlockEntity>,
+) -> Option<Arc<dyn Inventory + 'static>> {
+    if !ChestLikeProperties::handles_block_id(world.get_block(target_pos).id) {
+        return None;
+    }
+
+    let chest_props = ChestLikeProperties::from_state_id(world.get_block_state_id(target_pos));
+    let offset_dir = match chest_props.r#type {
+        ChestType::Single => return None,
+        ChestType::Left => chest_props.facing.rotate_clockwise(),
+        ChestType::Right => chest_props.facing.rotate_counter_clockwise(),
+    };
+
+    let neighbor_pos = target_pos.offset(offset_dir.to_offset());
+    let second_entity = world.get_block_entity(&neighbor_pos)?;
+
+    let first_inventory = entity.clone().get_inventory()?;
+    let second_inventory = second_entity.clone().get_inventory()?;
+
+    let (left, right) = if matches!(chest_props.r#type, ChestType::Right) {
+        (first_inventory, second_inventory)
+    } else {
+        (second_inventory, first_inventory)
+    };
+
+    Some(DoubleInventory::new(left, right))
+}
+
 impl HopperBlockEntity {
     pub const INVENTORY_SIZE: usize = 5;
     pub const ID: &'static str = "minecraft:hopper";
@@ -225,31 +259,33 @@ impl HopperBlockEntity {
             return false;
         }
 
-        if let Some(entity) = world.get_block_entity(pos_up)
-            && let Some(container) = entity.clone().get_inventory()
-        {
-            // TODO check WorldlyContainer
-            for i in 0..container.size() {
-                let mut item = container.get_stack(i);
-                if !item.is_empty() && container.can_transfer_to(self, i, &item) {
-                    //TODO WorldlyContainer
-                    let _backup = item.clone();
-                    let one_item = item.split(1);
-                    if Self::add_one_item(container.as_ref(), self, &one_item) {
-                        container.set_stack(i, item);
-                        // If extracting from furnace output slot (index 2), drop XP as orbs
-                        let furnace_output_slot: usize = 2;
-                        if i == furnace_output_slot
-                            && let Some(experience_container) =
-                                entity.clone().to_experience_container()
-                        {
-                            let xp = experience_container.extract_experience();
-                            if xp > 0 {
-                                let pos = self.position.to_f64();
-                                ExperienceOrbEntity::spawn(world, pos, xp as u32);
+        if let Some(entity) = world.get_block_entity(pos_up) {
+            if let Some(container) = get_inventory_if_double_chest(world, pos_up, &entity)
+                .or_else(|| entity.clone().get_inventory())
+            {
+                // TODO check WorldlyContainer
+                for i in 0..container.size() {
+                    let mut item = container.get_stack(i);
+                    if !item.is_empty() && container.can_transfer_to(self, i, &item) {
+                        //TODO WorldlyContainer
+                        let _backup = item.clone();
+                        let one_item = item.split(1);
+                        if Self::add_one_item(container.as_ref(), self, &one_item) {
+                            container.set_stack(i, item);
+                            // If extracting from furnace output slot (index 2), drop XP as orbs
+                            let furnace_output_slot: usize = 2;
+                            if i == furnace_output_slot
+                                && let Some(experience_container) =
+                                    entity.clone().to_experience_container()
+                            {
+                                let xp = experience_container.extract_experience();
+                                if xp > 0 {
+                                    let pos = self.position.to_f64();
+                                    ExperienceOrbEntity::spawn(world, pos, xp as u32);
+                                }
                             }
+                            return true;
                         }
-                        return true;
                     }
                 }
             }
@@ -370,9 +406,11 @@ impl HopperBlockEntity {
 
     fn eject_items(&self, world: &Arc<World>) -> bool {
         // TODO getEntityContainer
+        let facing = &self.position.offset(to_offset(&self.facing));
 
-        if let Some(entity) = world.get_block_entity(&self.position.offset(to_offset(&self.facing)))
-            && let Some(container) = entity.get_inventory()
+        if let Some(entity) = world.get_block_entity(facing)
+            && let Some(container) = get_inventory_if_double_chest(world, facing, &entity)
+                .or_else(|| entity.clone().get_inventory())
         {
             // TODO check WorldlyContainer
             let mut is_full = true;
